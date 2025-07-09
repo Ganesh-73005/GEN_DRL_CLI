@@ -111,46 +111,212 @@ drl modify validation_rules.drl
 ### 2. Interactive Mode Example
 
 ```bash
-$ drl --interactive
-DRL Management System - Interactive Mode
+C:\Users\ganes\Downloads\tkinter-drl-system>python drl_management_system.py --interactive
+=== DRL Management System - Interactive Mode ===
 Type 'help' for available commands or 'quit' to exit
 
-drl> scan /path/to/project
-Scanning repository: /path/to/project
-Found: 5 Java model files, 12 DRL files, 3 GDST files
+drl> scan
+Scanning repository: C:\Users\ganes\Downloads\tkinter-drl-system
+Found: 6 Java model files, 6 DRL files, 2 GDST files
+Repository scan completed successfully!
 Loading context into LLM memory...
-Sending context chunk 1/3 (approx. 3850 tokens)...
-Sending context chunk 2/3 (approx. 3920 tokens)...
-Sending context chunk 3/3 (approx. 1250 tokens)...
+Sending context chunk 1/2 (approx. 4264 tokens)...
+Sending context chunk 2/2 (approx. 3742 tokens)...
 Context loading complete!
 
 drl> modify
+
 Select a DRL file to modify:
+
 === DRL Rule Files ===
- 1. discount_rules.drl (/path.../discount_rules.drl) - 1204 bytes
- 2. validation.drl (/path.../validation.drl) - 845 bytes
-...
+ 1. new_rule_20250703_153606.drl (C:\Users\ganes\Downloads\tkinter-drl-system\new_rule_20250703_153606.drl) - 166 bytes
+ 2. new_rule_20250703_153613.drl (C:\Users\ganes\Downloads\tkinter-drl-system\new_rule_20250703_153613.drl) - 166 bytes
+ 3. new_rule_20250709_113356.drl (C:\Users\ganes\Downloads\tkinter-drl-system\new_rule_20250709_113356.drl) - 166 bytes
+ 4. customer-loyalty.drl (C:\Users\ganes\Downloads\tkinter-drl-system\example-springboot-project\src\main\resources\rules\customer-loyalty.drl) - 2835 bytes
+ 5. order-discounts.drl (C:\Users\ganes\Downloads\tkinter-drl-system\example-springboot-project\src\main\resources\rules\order-discounts.drl) - 4276 bytes
+ 6. risk-assessment.drl (C:\Users\ganes\Downloads\tkinter-drl-system\example-springboot-project\src\main\resources\rules\risk-assessment.drl) - 2588 bytes
 
-Enter file number to modify: 2
-Current content of validation.drl:
-===================================
-[file content shown here]
-===================================
+Enter file number to modify: 4
 
-Enter your modification requirements:
-Make the age validation more strict by:
-- Adding a minimum age of 18
-- Adding maximum age of 100
-- Include detailed error messages
+Current content of C:\Users\ganes\Downloads\tkinter-drl-system\example-springboot-project\src\main\resources\rules\customer-loyalty.drl:
+==================================================
+package com.example.drools.rules;
 
+import com.example.drools.model.Customer;
+import com.example.drools.model.CustomerType;
+import com.example.drools.model.Order;
+
+// Customer loyalty and tier upgrade rules
+
+rule "Upgrade to Premium Customer"
+    when
+        $customer : Customer(
+            customerType == CustomerType.REGULAR,
+            totalSpent > 5000.0,
+            loyaltyPoints > 1000
+        )
+    then
+        $customer.setCustomerType(CustomerType.PREMIUM);
+        $customer.addLoyaltyPoints(500); // Bonus points for upgrade
+        System.out.println("Customer " + $customer.getFullName() + " upgraded to Premium");
+end
+
+rule "Upgrade to VIP Customer"
+    when
+        $customer : Customer(
+            customerType == CustomerType.PREMIUM,
+            totalSpent > 15000.0,
+            loyaltyPoints > 5000
+        )
+    then
+        $customer.setCustomerType(CustomerType.VIP);
+        $customer.addLoyaltyPoints(1000); // Bonus points for VIP upgrade
+        System.out.println("Customer " + $customer.getFullName() + " upgraded to VIP");
+end
+
+rule "Award Loyalty Points for Order"
+    when
+        $order : Order(status == com.example.drools.model.OrderStatus.DELIVERED)
+        $customer : Customer(id == $order.customerId)
+    then
+        int points = (int) ($order.getTotalAmount() / 10); // 1 point per $10 spent
+        $customer.addLoyaltyPoints(points);
+        System.out.println("Awarded " + points + " loyalty points to " + $customer.getFullName());
+end
+
+rule "Birthday Bonus Points"
+    when
+        $customer : Customer(
+            dateOfBirth != null,
+            dateOfBirth.getMonthValue() == java.time.LocalDate.now().getMonthValue(),
+            dateOfBirth.getDayOfMonth() == java.time.LocalDate.now().getDayOfMonth()
+        )
+    then
+        $customer.addLoyaltyPoints(200); // Birthday bonus
+        System.out.println("Happy Birthday! Awarded 200 bonus points to " + $customer.getFullName());
+end
+
+rule "Inactive Customer Alert"
+    when
+        $customer : Customer(
+            isActive() == true,
+            orders.size() == 0 ||
+            orders.stream().noneMatch(order ->
+                order.getOrderDate().isAfter(java.time.LocalDateTime.now().minusMonths(6))
+            )
+        )
+    then
+        System.out.println("Alert: Customer " + $customer.getFullName() + " has been inactive for 6+ months");
+        // Could trigger re-engagement campaign
+end
+
+rule "High Value Customer Recognition"
+    when
+        $customer : Customer(
+            totalSpent > 25000.0,
+            customerType != CustomerType.VIP
+        )
+    then
+        $customer.setCustomerType(CustomerType.VIP);
+        $customer.addLoyaltyPoints(2000); // Special recognition bonus
+        System.out.println("High value customer " + $customer.getFullName() + " automatically upgraded to VIP");
+end
+
+==================================================
+
+Enter your modification requirements (press Ctrl+D or Ctrl+Z when finished):
+increase birthday bonus to 3000 points^Z
+^Z
 Modifying rule... This may take a moment.
 
 === Modified Rule ===
-[modified content shown]
+package com.example.drools.rules;
+
+import com.example.drools.model.Customer;
+import com.example.drools.model.CustomerType;
+import com.example.drools.model.Order;
+
+// Customer loyalty and tier upgrade rules
+
+rule "Upgrade to Premium Customer"
+    when
+        $customer : Customer(
+            customerType == CustomerType.REGULAR,
+            totalSpent > 5000.0,
+            loyaltyPoints > 1000
+        )
+    then
+        $customer.setCustomerType(CustomerType.PREMIUM);
+        $customer.addLoyaltyPoints(500); // Bonus points for upgrade
+        System.out.println("Customer " + $customer.getFullName() + " upgraded to Premium");
+end
+
+rule "Upgrade to VIP Customer"
+    when
+        $customer : Customer(
+            customerType == CustomerType.PREMIUM,
+            totalSpent > 15000.0,
+            loyaltyPoints > 5000
+        )
+    then
+        $customer.setCustomerType(CustomerType.VIP);
+        $customer.addLoyaltyPoints(1000); // Bonus points for VIP upgrade
+        System.out.println("Customer " + $customer.getFullName() + " upgraded to VIP");
+end
+
+rule "Award Loyalty Points for Order"
+    when
+        $order : Order(status == com.example.drools.model.OrderStatus.DELIVERED)
+        $customer : Customer(id == $order.customerId)
+    then
+        int points = (int) ($order.getTotalAmount() / 10); // 1 point per $10 spent
+        $customer.addLoyaltyPoints(points);
+        System.out.println("Awarded " + points + " loyalty points to " + $customer.getFullName());
+end
+
+rule "Birthday Bonus Points"
+    when
+        $customer : Customer(
+            dateOfBirth != null,
+            dateOfBirth.getMonthValue() == java.time.LocalDate.now().getMonthValue(),
+            dateOfBirth.getDayOfMonth() == java.time.LocalDate.now().getDayOfMonth()
+        )
+    then
+        // Increased birthday bonus to 3000 points as per requirement
+        $customer.addLoyaltyPoints(3000); // Birthday bonus
+        System.out.println("Happy Birthday! Awarded 3000 bonus points to " + $customer.getFullName());
+end
+
+rule "Inactive Customer Alert"
+    when
+        $customer : Customer(
+            isActive() == true,
+            orders.size() == 0 ||
+            orders.stream().noneMatch(order ->
+                order.getOrderDate().isAfter(java.time.LocalDateTime.now().minusMonths(6))
+            )
+        )
+    then
+        System.out.println("Alert: Customer " + $customer.getFullName() + " has been inactive for 6+ months");
+        // Could trigger re-engagement campaign
+end
+
+rule "High Value Customer Recognition"
+    when
+        $customer : Customer(
+            totalSpent > 25000.0,
+            customerType != CustomerType.VIP
+        )
+    then
+        $customer.setCustomerType(CustomerType.VIP);
+        $customer.addLoyaltyPoints(2000); // Special recognition bonus
+        System.out.println("High value customer " + $customer.getFullName() + " automatically upgraded to VIP");
+end
+==================================================
 
 Save this modified rule? (y/n): y
-Original rule backed up to: validation.drl.bak
-Modified rule saved to: validation.drl
+Original rule backed up to: C:\Users\ganes\Downloads\tkinter-drl-system\example-springboot-project\src\main\resources\rules\customer-loyalty.drl.bak
+Modified rule saved to: C:\Users\ganes\Downloads\tkinter-drl-system\example-springboot-project\src\main\resources\rules\customer-loyalty.drl
 ```
 
 ### 3. Direct Command Example
