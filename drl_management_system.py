@@ -9,11 +9,14 @@ import json
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import re
 import subprocess
 import tempfile
 from datetime import datetime
+import time
+from queue import Queue
+from threading import Thread
 
 # Groq SDK import
 try:
@@ -161,43 +164,95 @@ class RepositoryScanner:
         
         return "\n".join(context_parts)
 
+class TokenBucket:
+    """Token bucket rate limiter implementation"""
+    def __init__(self, tokens_per_minute: int):
+        self.capacity = tokens_per_minute
+        self.tokens = tokens_per_minute
+        self.last_refill = time.time()
+        self.refill_rate = tokens_per_minute / 60  # Tokens per second
+    
+    def consume(self, tokens: int) -> bool:
+        """Try to consume tokens, returns True if successful"""
+        now = time.time()
+        elapsed = now - self.last_refill
+        self.last_refill = now
+        
+        # Refill the bucket
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        
+        if self.tokens >= tokens:
+            self.tokens -= tokens
+            return True
+        return False
+    
+    def wait_for_tokens(self, tokens: int):
+        """Wait until enough tokens are available"""
+        while not self.consume(tokens):
+            # Calculate how long to wait
+            deficit = tokens - self.tokens
+            wait_time = deficit / self.refill_rate
+            time.sleep(max(0.1, wait_time))
+
 class GroqDRLAssistant:
-    """AI Assistant using Groq SDK for DRL rule generation and analysis"""
+    """AI Assistant using Groq SDK for DRL rule generation and modification"""
     
     def __init__(self, api_key: str = None):
         self.groq_client = None
+        self.context_memory = []  # Stores the context in memory
+        self.token_bucket = TokenBucket(6000)  # 6000 tokens per minute rate limit
+        
         if Groq and api_key:
             try:
                 self.groq_client = Groq(api_key=api_key)
             except Exception as e:
                 print(f"Failed to initialize Groq client: {e}")
     
-    def generate_drl_rule(self, context: str, requirements: str) -> str:
-        """Generate DRL rule using Groq SDK"""
-        if not self.groq_client:
-            raise Exception("Groq client not initialized. Please set API key.")
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count (approximation: 1 token ~= 4 characters)"""
+        return max(1, len(text) // 4)
+    
+    def _split_context(self, context: str, max_tokens: int = 4000) -> List[str]:
+        """Split context into chunks that are under the token limit"""
+        # Simple implementation - split by lines to preserve logical structure
+        lines = context.split('\n')
+        chunks = []
+        current_chunk = []
+        current_length = 0
         
+        for line in lines:
+            line_length = self._estimate_tokens(line)
+            if current_length + line_length > max_tokens and current_chunk:
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            current_chunk.append(line)
+            current_length += line_length
+        
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
+        
+        return chunks
+    
+    def _send_context_chunk(self, chunk: str, is_last: bool = False) -> str:
+        """Send a single context chunk to the LLM for storage"""
+        # Estimate total tokens for the request (chunk + prompt)
         prompt = f"""
-You are a Drools rules expert. Generate a complete DRL rule based on the repository context and requirements.
+You are a context-aware DRL rules expert. I'm going to provide you with repository context that you need to remember for subsequent questions.
 
-REPOSITORY CONTEXT:
-{context[:8000]}  # Limit context to avoid token limits
-
-REQUIREMENTS:
-{requirements}
+CONTEXT CHUNK:
+{chunk}
 
 INSTRUCTIONS:
-1. Use the Java model classes from the context
-2. Follow proper DRL syntax
-3. Include clear comments
-4. Reference existing patterns from the DRL files in context
-5. Ensure the rule integrates well with existing rules
-6. Return ONLY the complete DRL rule content with proper syntax
-7. DO NOT include any markdown code blocks (```drl``` or ```)
-8. DO NOT include any thinking tags (<Thinking> or </Thinking>)
-9. DO NOT include any explanatory text before or after the rule
-10. Return the full DRL file content, not just the modified part
+1. Store this information in your context memory
+2. Acknowledge that you've received this chunk by responding with "ACKNOWLEDGED"
+3. If this is the last chunk, respond with "CONTEXT_READY"
+4. Do not analyze or respond to the content at this time
 """
+        estimated_tokens = self._estimate_tokens(prompt) + 100  # Add buffer
+        
+        # Wait until we have enough tokens
+        self.token_bucket.wait_for_tokens(estimated_tokens)
         
         try:
             chat_completion = self.groq_client.chat.completions.create(
@@ -208,6 +263,76 @@ INSTRUCTIONS:
                     }
                 ],
                 model="deepseek-r1-distill-llama-70b",
+                temperature=0.1,
+                max_tokens=1000,
+                top_p=1,
+                stream=False,
+                stop=None
+            )
+            
+            return chat_completion.choices[0].message.content
+            
+        except Exception as e:
+            raise Exception(f"Failed to send context chunk: {str(e)}")
+    
+    def load_context(self, context: str):
+        """Load context into LLM memory by sending it in chunks"""
+        if not self.groq_client:
+            raise Exception("Groq client not initialized. Please set API key.")
+        
+        print("Loading context into LLM memory...")
+        chunks = self._split_context(context)
+        total_chunks = len(chunks)
+        
+        for i, chunk in enumerate(chunks, 1):
+            print(f"Sending context chunk {i}/{total_chunks} (approx. {self._estimate_tokens(chunk)} tokens)...")
+            is_last = (i == total_chunks)
+            response = self._send_context_chunk(chunk, is_last)
+            
+            if "CONTEXT_READY" in response or is_last:
+                print("Context loading complete!")
+                return
+        
+        # If we get here without CONTEXT_READY, send a final confirmation
+        self._send_context_chunk("This is the end of the context. Please respond with CONTEXT_READY.", True)
+        print("Context loading complete!")
+    
+    def generate_drl_rule(self, requirements: str) -> str:
+        """Generate DRL rule using Groq SDK with pre-loaded context"""
+        if not self.groq_client:
+            raise Exception("Groq client not initialized. Please set API key.")
+        
+        prompt = f"""
+You are a Drools rules expert. Generate a complete DRL rule based on the repository context you have in memory and these requirements.
+
+REQUIREMENTS:
+{requirements}
+
+INSTRUCTIONS:
+1. Use the Java model classes from your context memory
+2. Follow proper DRL syntax
+3. Include clear comments
+4. Reference existing patterns from the DRL files in your context
+5. Ensure the rule integrates well with existing rules
+6. Return ONLY the complete DRL rule content with proper syntax
+7. DO NOT include any markdown code blocks (```drl``` or ```)
+8. DO NOT include any thinking tags (<Thinking> or </Thinking>)
+9. DO NOT include any explanatory text before or after the rule
+10. Return the full DRL file content, not just the modified part
+"""
+        # Estimate tokens and wait
+        estimated_tokens = self._estimate_tokens(prompt) + 2000  # Buffer for response
+        self.token_bucket.wait_for_tokens(estimated_tokens)
+        
+        try:
+            chat_completion = self.groq_client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                model="compound-beta",
                 temperature=0.5,
                 max_tokens=8192,
                 top_p=1,
@@ -227,29 +352,35 @@ INSTRUCTIONS:
         except Exception as e:
             raise Exception(f"Failed to generate rule: {str(e)}")
     
-    def analyze_drl_rules(self, context: str, rule_content: str) -> Dict:
-        """Analyze DRL rules using Groq SDK"""
+    def modify_drl_rule(self, original_rule: str, requirements: str) -> str:
+        """Modify an existing DRL rule using Groq SDK with pre-loaded context"""
         if not self.groq_client:
             raise Exception("Groq client not initialized. Please set API key.")
         
         prompt = f"""
-Analyze the following DRL rule in the context of the repository.
+You are a Drools rules expert. Modify the following DRL rule based on the repository context you have in memory and these requirements.
 
-REPOSITORY CONTEXT:
-{context[:6000]}
+ORIGINAL RULE:
+{original_rule}
 
-DRL RULE TO ANALYZE:
-{rule_content}
+REQUIREMENTS:
+{requirements}
 
-Provide analysis in JSON format with these keys:
-- summary: Brief description of what the rule does
-- issues: List of potential issues or problems
-- suggestions: List of improvement suggestions
-- compatibility: How well it integrates with existing rules
-- performance: Performance considerations
-
-Return valid JSON only.
+INSTRUCTIONS:
+1. Use the Java model classes from your context memory
+2. Follow proper DRL syntax
+3. Include clear comments explaining changes
+4. Reference existing patterns from the DRL files in your context
+5. Ensure the modified rule integrates well with existing rules
+6. Return ONLY the complete modified DRL rule content with proper syntax
+7. DO NOT include any markdown code blocks (```drl``` or ```)
+8. DO NOT include any thinking tags (<Thinking> or </Thinking>)
+9. DO NOT include any explanatory text before or after the rule
+10. Return the full DRL file content, not just the modified part
 """
+        # Estimate tokens and wait
+        estimated_tokens = self._estimate_tokens(prompt) + 2000  # Buffer for response
+        self.token_bucket.wait_for_tokens(estimated_tokens)
         
         try:
             chat_completion = self.groq_client.chat.completions.create(
@@ -259,7 +390,7 @@ Return valid JSON only.
                         "content": prompt
                     }
                 ],
-                model="deepseek-r1-distill-llama-70b",
+                model="compound-beta",
                 temperature=0.5,
                 max_tokens=8192,
                 top_p=1,
@@ -267,21 +398,17 @@ Return valid JSON only.
                 stop=None
             )
             
-            result = chat_completion.choices[0].message.content
+            # Clean the output to remove any unwanted tags or markdown
+            rule_content = chat_completion.choices[0].message.content
             
-            try:
-                return json.loads(result)
-            except json.JSONDecodeError:
-                return {
-                    "summary": result,
-                    "issues": "Could not parse JSON response",
-                    "suggestions": "Please check the analysis manually",
-                    "compatibility": "Unknown",
-                    "performance": "Unknown"
-                }
-                
+            rule_content = re.sub(r"<Thinking>.*?</Thinking>", "", rule_content, flags=re.DOTALL)
+            rule_content = rule_content.replace("```drl", "").replace("```", "")
+            rule_content = rule_content.strip()
+            
+            return rule_content
+            
         except Exception as e:
-            raise Exception(f"Failed to analyze rule: {str(e)}")
+            raise Exception(f"Failed to modify rule: {str(e)}")
 
 class ConfigManager:
     """Manages configuration settings"""
@@ -364,6 +491,10 @@ class DRLManagementCLI:
         else:
             self.repository_context = self.scanner.build_context()
             print("Repository scan completed successfully!")
+            
+            # Load context into LLM memory if assistant is available
+            if self.drl_assistant and self.drl_assistant.groq_client:
+                self.drl_assistant.load_context(self.repository_context)
     
     def list_files(self, file_type: str = "all"):
         """List files found in repository"""
@@ -427,9 +558,6 @@ end
             print("Error: Groq API key not configured. Use 'config set-api-key' command first.")
             return
         
-        if not self.repository_context:
-            print("Warning: No repository context available. Consider scanning a repository first.")
-        
         if not requirements:
             print("Enter your rule requirements (press Ctrl+D or Ctrl+Z when finished):")
             requirements_lines = []
@@ -447,7 +575,7 @@ end
         print("Generating rule... This may take a moment.")
         
         try:
-            rule_content = self.drl_assistant.generate_drl_rule(self.repository_context, requirements)
+            rule_content = self.drl_assistant.generate_drl_rule(requirements)
             
             if output_file:
                 with open(output_file, 'w', encoding='utf-8') as f:
@@ -472,57 +600,83 @@ end
         except Exception as e:
             print(f"Error generating rule: {e}")
     
-    def analyze_rule(self, file_path: str = None):
-        """Analyze a DRL rule using AI"""
+    def modify_rule(self, file_path: str = None, requirements: str = None):
+        """Modify an existing DRL rule using AI"""
         if not self.drl_assistant or not self.drl_assistant.groq_client:
             print("Error: Groq API key not configured. Use 'config set-api-key' command first.")
             return
         
-        rule_content = ""
-        
-        if file_path:
-            if not os.path.exists(file_path):
-                print(f"Error: File '{file_path}' does not exist")
+        # Get the DRL file to modify
+        if not file_path:
+            if not self.scanner or not self.scanner.drl_files:
+                print("No DRL files found. Please scan a repository first.")
                 return
             
+            print("\nSelect a DRL file to modify:")
+            self.scanner.list_files("drl")
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    rule_content = f.read()
-            except Exception as e:
-                print(f"Error reading file: {e}")
+                selection = int(input("\nEnter file number to modify: ")) - 1
+                if 0 <= selection < len(self.scanner.drl_files):
+                    file_path = str(self.scanner.drl_files[selection])
+                else:
+                    print("Invalid selection")
+                    return
+            except ValueError:
+                print("Please enter a valid number")
                 return
-        else:
-            print("Enter the DRL rule to analyze (press Ctrl+D or Ctrl+Z when finished):")
-            rule_lines = []
+        
+        # Read the original rule content
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                original_rule = f.read()
+        except Exception as e:
+            print(f"Error reading file: {e}")
+            return
+        
+        # Get modification requirements
+        if not requirements:
+            print(f"\nCurrent content of {file_path}:")
+            print("=" * 50)
+            print(original_rule)
+            print("=" * 50)
+            print("\nEnter your modification requirements (press Ctrl+D or Ctrl+Z when finished):")
+            requirements_lines = []
             try:
                 while True:
                     line = input()
-                    rule_lines.append(line)
+                    requirements_lines.append(line)
             except EOFError:
-                rule_content = "\n".join(rule_lines)
+                requirements = "\n".join(requirements_lines)
         
-        if not rule_content.strip():
-            print("Error: No rule content provided")
+        if not requirements.strip():
+            print("Error: No requirements provided")
             return
         
-        print("Analyzing rule... This may take a moment.")
+        print("Modifying rule... This may take a moment.")
         
         try:
-            analysis = self.drl_assistant.analyze_drl_rules(self.repository_context, rule_content)
+            modified_rule = self.drl_assistant.modify_drl_rule(original_rule, requirements)
             
-            print("\n=== Rule Analysis ===")
-            if isinstance(analysis, dict):
-                print(f"SUMMARY:\n{analysis.get('summary', 'N/A')}\n")
-                print(f"ISSUES:\n{analysis.get('issues', 'N/A')}\n")
-                print(f"SUGGESTIONS:\n{analysis.get('suggestions', 'N/A')}\n")
-                print(f"COMPATIBILITY:\n{analysis.get('compatibility', 'N/A')}\n")
-                print(f"PERFORMANCE:\n{analysis.get('performance', 'N/A')}")
-            else:
-                print(str(analysis))
+            print("\n=== Modified Rule ===")
+            print(modified_rule)
             print("=" * 50)
+            
+            save_choice = input("\nSave this modified rule? (y/n): ").lower()
+            if save_choice == 'y':
+                # Backup original file
+                backup_path = f"{file_path}.bak"
+                with open(backup_path, 'w', encoding='utf-8') as f:
+                    f.write(original_rule)
+                
+                # Save modified version
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(modified_rule)
+                
+                print(f"Original rule backed up to: {backup_path}")
+                print(f"Modified rule saved to: {file_path}")
         
         except Exception as e:
-            print(f"Error analyzing rule: {e}")
+            print(f"Error modifying rule: {e}")
     
     def show_context(self, limit: int = 1000):
         """Show repository context"""
@@ -626,9 +780,9 @@ end
                     output_file = command[1] if len(command) > 1 else None
                     self.generate_rule(output_file=output_file)
                 
-                elif cmd == 'analyze':
+                elif cmd == 'modify':
                     file_path = command[1] if len(command) > 1 else None
-                    self.analyze_rule(file_path)
+                    self.modify_rule(file_path)
                 
                 elif cmd == 'context':
                     limit = int(command[1]) if len(command) > 1 else 1000
@@ -662,8 +816,8 @@ File Operations:
   edit [file]          - Edit file (creates new if not specified)
 
 AI Operations:
-  generate [output]    - Generate DRL rule using AI
-  analyze [file]       - Analyze DRL rule using AI
+  generate [output]    - Generate new DRL rule using AI
+  modify [file]        - Modify existing DRL rule using AI
 
 Configuration:
   config show          - Show current configuration
@@ -679,7 +833,7 @@ Examples:
   scan /path/to/project
   list drl
   generate my_rule.drl
-  analyze existing_rule.drl
+  modify existing_rule.drl
   config set-api-key
 """
         print(help_text)
@@ -712,9 +866,10 @@ def main():
     generate_parser.add_argument("--output", "-o", help="Output file")
     generate_parser.add_argument("--requirements", "-r", help="Rule requirements")
     
-    # Analyze command
-    analyze_parser = subparsers.add_parser("analyze", help="Analyze DRL rule")
-    analyze_parser.add_argument("file", nargs="?", help="File to analyze")
+    # Modify command
+    modify_parser = subparsers.add_parser("modify", help="Modify DRL rule")
+    modify_parser.add_argument("file", nargs="?", help="File to modify")
+    modify_parser.add_argument("--requirements", "-r", help="Modification requirements")
     
     # Context command
     context_parser = subparsers.add_parser("context", help="Show repository context")
@@ -743,8 +898,8 @@ def main():
             cli.edit_file(args.file)
         elif args.command == "generate":
             cli.generate_rule(args.requirements, args.output)
-        elif args.command == "analyze":
-            cli.analyze_rule(args.file)
+        elif args.command == "modify":
+            cli.modify_rule(args.file, args.requirements)
         elif args.command == "context":
             cli.show_context(args.limit)
         elif args.command == "config":
